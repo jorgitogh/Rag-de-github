@@ -5,14 +5,14 @@ import shutil
 import hashlib
 import tempfile
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional
 
 import streamlit as st
 from git import Repo
 from groq import Groq
 
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
+from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
@@ -140,8 +140,11 @@ def make_line_aware_docs(repo_root: Path) -> List[Document]:
     return docs
 
 @st.cache_resource(show_spinner=False)
-def get_embeddings(model_name: str):
-    return HuggingFaceEmbeddings(model_name=model_name)
+def get_embeddings(model_name: str, hf_api_key: str):
+    return HuggingFaceInferenceAPIEmbeddings(
+        api_key=hf_api_key,
+        model_name=model_name,
+    )
 
 @st.cache_resource(show_spinner=False)
 def get_groq_client(api_key: str):
@@ -156,15 +159,23 @@ def groq_generate(client: Groq, model_name: str, prompt: str) -> str:
     )
     return (completion.choices[0].message.content or "").strip()
 
-def build_vectorstore(docs: List[Document], embedding_model: str) -> FAISS:
+def build_vectorstore(docs: List[Document], embedding_model: str, hf_api_key: str, repo_url: str) -> Chroma:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", " ", ""],
     )
     chunks = splitter.split_documents(docs)
-    embeddings = get_embeddings(embedding_model)
-    return FAISS.from_documents(chunks, embeddings)
+    embeddings = get_embeddings(embedding_model, hf_api_key)
+    collection_name = f"repo_{hashlib.sha1(repo_url.encode('utf-8')).hexdigest()[:12]}"
+    persist_dir = Path(tempfile.gettempdir()) / "github_rag_chroma"
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    return Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_name=collection_name,
+        persist_directory=str(persist_dir),
+    )
 
 def format_sources(docs: List[Document], max_sources: int = 5) -> str:
     seen = set()
@@ -182,7 +193,7 @@ def format_sources(docs: List[Document], max_sources: int = 5) -> str:
             break
     return "\n".join(out) if out else "_(sin fuentes)_"
 
-def rag_answer(query: str, vs: FAISS, llm_client: Groq, llm_model: str, k: int = TOP_K) -> Tuple[str, List[Document]]:
+def rag_answer(query: str, vs: Chroma, llm_client: Groq, llm_model: str, k: int = TOP_K) -> Tuple[str, List[Document]]:
     retriever = vs.as_retriever(search_kwargs={"k": k})
     ctx_docs = retriever.get_relevant_documents(query)
 
@@ -202,7 +213,7 @@ def rag_answer(query: str, vs: FAISS, llm_client: Groq, llm_model: str, k: int =
     answer = groq_generate(llm_client, llm_model, prompt)
     return answer, ctx_docs
 
-def generate_patch(request: str, vs: FAISS, llm_client: Groq, llm_model: str, k: int = TOP_K) -> Tuple[str, List[Document]]:
+def generate_patch(request: str, vs: Chroma, llm_client: Groq, llm_model: str, k: int = TOP_K) -> Tuple[str, List[Document]]:
     """
     Genera un diff estilo git. No aplica cambios; solo muestra patch.
     """
@@ -234,6 +245,7 @@ with st.sidebar:
     repo_url = st.text_input("URL repo público", placeholder="https://github.com/user/repo")
     branch = st.text_input("Branch (opcional)", placeholder="main")
     embedding_model = st.text_input("Embeddings", value=DEFAULT_EMBEDDING_MODEL)
+    hf_api_key = st.text_input("HUGGINGFACE_API_KEY", value=os.getenv("HUGGINGFACE_API_KEY", ""), type="password")
     llm_model = st.text_input("LLM (Groq)", value=DEFAULT_LLM_MODEL)
     groq_api_key = st.text_input("GROQ_API_KEY", value=os.getenv("GROQ_API_KEY", ""), type="password")
     top_k = st.slider("Top-K chunks", 3, 12, TOP_K)
@@ -251,6 +263,8 @@ if "llm_model" not in st.session_state:
 if do_index:
     if not is_github_repo_url(repo_url):
         st.error("URL inválida. Usa formato: https://github.com/user/repo")
+    elif not hf_api_key.strip():
+        st.error("Missing HUGGINGFACE_API_KEY. Add it in the sidebar or as an environment variable.")
     elif not groq_api_key.strip():
         st.error("Missing GROQ_API_KEY. Add it in the sidebar or as an environment variable.")
     else:
@@ -272,8 +286,8 @@ if do_index:
             docs = make_line_aware_docs(Path(st.session_state.repo_path))
             st.write(f"📄 Documentos base: {len(docs)}")
 
-        with st.spinner("Construyendo índice vectorial (FAISS)…"):
-            vs = build_vectorstore(docs, embedding_model)
+        with st.spinner("Construyendo índice vectorial (ChromaDB)…"):
+            vs = build_vectorstore(docs, embedding_model, hf_api_key.strip(), repo_url.strip())
             st.session_state.vs = vs
 
         with st.spinner("Conectando con Groq..."):
