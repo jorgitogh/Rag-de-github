@@ -170,10 +170,48 @@ def build_vectorstore(docs: List[Document], embedding_model: str, hf_api_key: st
     chunks = [c for c in chunks if c.page_content and c.page_content.strip()]
     if not chunks:
         raise ValueError("No valid text chunks were generated from the repository.")
+    chunks = chunks[:MAX_CHUNKS]
+    texts = [c.page_content for c in chunks]
+    metadatas = [c.metadata for c in chunks]
     embeddings = get_embeddings(embedding_model, hf_api_key)
-    return FAISS.from_documents(
-        documents=chunks,
+
+    def _normalize_vectors(raw, expected_count: int):
+        if isinstance(raw, dict):
+            err = raw.get("error") or raw
+            raise ValueError(f"Hugging Face embeddings API error: {err}")
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("Hugging Face embeddings API returned an empty or invalid response.")
+        if isinstance(raw[0], (int, float)):
+            if expected_count == 1:
+                return [[float(x) for x in raw]]
+            return None
+        if isinstance(raw[0], list):
+            if len(raw) != expected_count:
+                return None
+            return [[float(x) for x in row] for row in raw]
+        return None
+
+    raw_vectors = embeddings.embed_documents(texts)
+    vectors = _normalize_vectors(raw_vectors, len(texts))
+
+    # Some providers/models return a single vector or partial rows for batched inputs.
+    if vectors is None:
+        vectors = []
+        for text in texts:
+            single = embeddings.embed_documents([text])
+            single_vec = _normalize_vectors(single, 1)
+            if not single_vec:
+                raise ValueError("Could not normalize embeddings response for one or more chunks.")
+            vectors.append(single_vec[0])
+
+    dim = len(vectors[0])
+    if any(len(v) != dim for v in vectors):
+        raise ValueError("Inconsistent embedding dimensions returned by Hugging Face API.")
+
+    return FAISS.from_embeddings(
+        text_embeddings=list(zip(texts, vectors)),
         embedding=embeddings,
+        metadatas=metadatas,
     )
 
 def format_sources(docs: List[Document], max_sources: int = 5) -> str:
