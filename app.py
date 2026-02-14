@@ -11,15 +11,20 @@ import streamlit as st
 from git import Repo
 from groq import Groq
 
-from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2" 
+
+# ----------------------------
+# Config
+# ----------------------------
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile"
+
 MAX_FILES = 600
-MAX_FILE_BYTES = 700_000  
+MAX_FILE_BYTES = 700_000
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
 MAX_CHUNKS = 1200
@@ -44,6 +49,9 @@ ALLOWED_EXT = {
 BINARY_EXT = {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".tar", ".gz", ".7z", ".exe", ".bin"}
 
 
+# ----------------------------
+# Repo helpers
+# ----------------------------
 def is_github_repo_url(url: str) -> bool:
     return bool(re.match(r"^https?://github\.com/[^/]+/[^/]+/?$", url.strip()))
 
@@ -61,7 +69,7 @@ def should_skip_path(p: Path) -> bool:
     name = p.name
     if ext in BINARY_EXT:
         return True
-    if name == "package-lock.json" or name == "yarn.lock" or name == "pnpm-lock.yaml":
+    if name in {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"}:
         return True
     if name == "Dockerfile":
         return False
@@ -118,11 +126,7 @@ def make_line_aware_docs(repo_root: Path) -> List[Document]:
             docs.append(
                 Document(
                     page_content=content,
-                    metadata={
-                        "path": rel,
-                        "start_line": start_line,
-                        "end_line": end_line,
-                    },
+                    metadata={"path": rel, "start_line": start_line, "end_line": end_line},
                 )
             )
             buf, buf_len = [], 0
@@ -130,7 +134,7 @@ def make_line_aware_docs(repo_root: Path) -> List[Document]:
 
         for line in lines:
             line_len = len(line) + 1
-            if buf_len + line_len > CHUNK_SIZE * 2 and buf: 
+            if buf_len + line_len > CHUNK_SIZE * 2 and buf:
                 flush(current_line - 1)
             buf.append(line)
             buf_len += line_len
@@ -140,12 +144,14 @@ def make_line_aware_docs(repo_root: Path) -> List[Document]:
 
     return docs
 
+
+# ----------------------------
+# Models
+# ----------------------------
 @st.cache_resource(show_spinner=False)
-def get_embeddings(model_name: str, hf_api_key: str):
-    return HuggingFaceInferenceAPIEmbeddings(
-        api_key=hf_api_key,
-        model_name=model_name,
-    )
+def get_embeddings(model_name: str):
+    # Embeddings locales (sin HF API) -> evita respuestas inválidas para FAISS
+    return HuggingFaceEmbeddings(model_name=model_name)
 
 @st.cache_resource(show_spinner=False)
 def get_groq_client(api_key: str):
@@ -160,7 +166,11 @@ def groq_generate(client: Groq, prompt: str) -> str:
     )
     return (completion.choices[0].message.content or "").strip()
 
-def build_vectorstore(docs: List[Document], embedding_model: str, hf_api_key: str) -> FAISS:
+
+# ----------------------------
+# Vectorstore
+# ----------------------------
+def build_vectorstore(docs: List[Document], embedding_model: str) -> FAISS:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -168,51 +178,14 @@ def build_vectorstore(docs: List[Document], embedding_model: str, hf_api_key: st
     )
     chunks = splitter.split_documents(docs)
     chunks = [c for c in chunks if c.page_content and c.page_content.strip()]
+    chunks = chunks[:MAX_CHUNKS]
+
     if not chunks:
         raise ValueError("No valid text chunks were generated from the repository.")
-    chunks = chunks[:MAX_CHUNKS]
-    texts = [c.page_content for c in chunks]
-    metadatas = [c.metadata for c in chunks]
-    embeddings = get_embeddings(embedding_model, hf_api_key)
 
-    def _normalize_vectors(raw, expected_count: int):
-        if isinstance(raw, dict):
-            err = raw.get("error") or raw
-            raise ValueError(f"Hugging Face embeddings API error: {err}")
-        if not isinstance(raw, list) or not raw:
-            raise ValueError("Hugging Face embeddings API returned an empty or invalid response.")
-        if isinstance(raw[0], (int, float)):
-            if expected_count == 1:
-                return [[float(x) for x in raw]]
-            return None
-        if isinstance(raw[0], list):
-            if len(raw) != expected_count:
-                return None
-            return [[float(x) for x in row] for row in raw]
-        return None
+    embeddings = get_embeddings(embedding_model)
+    return FAISS.from_documents(chunks, embeddings)
 
-    raw_vectors = embeddings.embed_documents(texts)
-    vectors = _normalize_vectors(raw_vectors, len(texts))
-
-    # Some providers/models return a single vector or partial rows for batched inputs.
-    if vectors is None:
-        vectors = []
-        for text in texts:
-            single = embeddings.embed_documents([text])
-            single_vec = _normalize_vectors(single, 1)
-            if not single_vec:
-                raise ValueError("Could not normalize embeddings response for one or more chunks.")
-            vectors.append(single_vec[0])
-
-    dim = len(vectors[0])
-    if any(len(v) != dim for v in vectors):
-        raise ValueError("Inconsistent embedding dimensions returned by Hugging Face API.")
-
-    return FAISS.from_embeddings(
-        text_embeddings=list(zip(texts, vectors)),
-        embedding=embeddings,
-        metadatas=metadatas,
-    )
 
 def format_sources(docs: List[Document], max_sources: int = 5) -> str:
     seen = set()
@@ -230,13 +203,19 @@ def format_sources(docs: List[Document], max_sources: int = 5) -> str:
             break
     return "\n".join(out) if out else "_(sin fuentes)_"
 
+
+# ----------------------------
+# RAG
+# ----------------------------
 def rag_answer(query: str, vs: FAISS, llm_client: Groq, k: int = TOP_K) -> Tuple[str, List[Document]]:
     retriever = vs.as_retriever(search_kwargs={"k": k})
     ctx_docs = retriever.get_relevant_documents(query)
 
     context = "\n\n".join(
-        [f"[{i+1}] FILE={d.metadata.get('path')} LINES={d.metadata.get('start_line')}-{d.metadata.get('end_line')}\n{d.page_content}"
-         for i, d in enumerate(ctx_docs)]
+        [
+            f"[{i+1}] FILE={d.metadata.get('path')} LINES={d.metadata.get('start_line')}-{d.metadata.get('end_line')}\n{d.page_content}"
+            for i, d in enumerate(ctx_docs)
+        ]
     )
 
     system = (
@@ -250,16 +229,16 @@ def rag_answer(query: str, vs: FAISS, llm_client: Groq, k: int = TOP_K) -> Tuple
     answer = groq_generate(llm_client, prompt)
     return answer, ctx_docs
 
+
 def generate_patch(request: str, vs: FAISS, llm_client: Groq, k: int = TOP_K) -> Tuple[str, List[Document]]:
-    """
-    Genera un diff estilo git. No aplica cambios; solo muestra patch.
-    """
     retriever = vs.as_retriever(search_kwargs={"k": k})
     ctx_docs = retriever.get_relevant_documents(request)
 
     context = "\n\n".join(
-        [f"[{i+1}] FILE={d.metadata.get('path')} LINES={d.metadata.get('start_line')}-{d.metadata.get('end_line')}\n{d.page_content}"
-         for i, d in enumerate(ctx_docs)]
+        [
+            f"[{i+1}] FILE={d.metadata.get('path')} LINES={d.metadata.get('start_line')}-{d.metadata.get('end_line')}\n{d.page_content}"
+            for i, d in enumerate(ctx_docs)
+        ]
     )
 
     system = (
@@ -274,6 +253,9 @@ def generate_patch(request: str, vs: FAISS, llm_client: Groq, k: int = TOP_K) ->
     return diff, ctx_docs
 
 
+# ----------------------------
+# UI
+# ----------------------------
 st.set_page_config(page_title="GitHub RAG (LangChain)", layout="wide")
 st.title("🔎 GitHub RAG — pregunta a cualquier repo (con citas)")
 
@@ -281,8 +263,7 @@ with st.sidebar:
     st.header("Indexación")
     repo_url = st.text_input("URL repo público", placeholder="https://github.com/user/repo")
     branch = st.text_input("Branch (opcional)", placeholder="main")
-    embedding_model = st.text_input("Embeddings", value=DEFAULT_EMBEDDING_MODEL)
-    hf_api_key = st.text_input("HUGGINGFACE_API_KEY", value=os.getenv("HUGGINGFACE_API_KEY", ""), type="password")
+    embedding_model = st.text_input("Embeddings (local)", value=DEFAULT_EMBEDDING_MODEL)
     groq_api_key = st.text_input("GROQ_API_KEY", value=os.getenv("GROQ_API_KEY", ""), type="password")
     st.caption(f"Groq model: `{DEFAULT_LLM_MODEL}`")
     top_k = st.slider("Top-K chunks", 3, 12, TOP_K)
@@ -298,8 +279,6 @@ if "llm" not in st.session_state:
 if do_index:
     if not is_github_repo_url(repo_url):
         st.error("URL inválida. Usa formato: https://github.com/user/repo")
-    elif not hf_api_key.strip():
-        st.error("Missing HUGGINGFACE_API_KEY. Add it in the sidebar or as an environment variable.")
     elif not groq_api_key.strip():
         st.error("Missing GROQ_API_KEY. Add it in the sidebar or as an environment variable.")
     else:
@@ -309,7 +288,6 @@ if do_index:
             if target.exists():
                 shutil.rmtree(target, ignore_errors=True)
 
-            # shallow clone
             if branch.strip():
                 Repo.clone_from(repo_url, target, depth=1, branch=branch.strip())
             else:
@@ -322,7 +300,7 @@ if do_index:
             st.write(f"📄 Documentos base: {len(docs)}")
 
         with st.spinner("Construyendo índice vectorial (FAISS)…"):
-            vs = build_vectorstore(docs, embedding_model, hf_api_key.strip())
+            vs = build_vectorstore(docs, embedding_model)
             st.session_state.vs = vs
 
         with st.spinner("Conectando con Groq..."):
