@@ -167,6 +167,9 @@ def build_vectorstore(docs: List[Document], embedding_model: str, hf_api_key: st
         separators=["\n\n", "\n", " ", ""],
     )
     chunks = splitter.split_documents(docs)
+    chunks = [c for c in chunks if c.page_content and c.page_content.strip()]
+    if not chunks:
+        raise ValueError("No valid text chunks were generated from the repository.")
     embeddings = get_embeddings(embedding_model, hf_api_key)
     collection_name = f"repo_{hashlib.sha1(repo_url.encode('utf-8')).hexdigest()[:12]}"
     persist_dir = Path(tempfile.gettempdir()) / "github_rag_chroma"
