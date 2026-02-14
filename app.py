@@ -12,12 +12,12 @@ from git import Repo
 from groq import Groq
 
 from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2" 
-DEFAULT_LLM_MODEL = "llama-3.1-8b-instant"
+DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile"
 MAX_FILES = 600
 MAX_FILE_BYTES = 700_000  
 CHUNK_SIZE = 1200
@@ -151,16 +151,16 @@ def get_embeddings(model_name: str, hf_api_key: str):
 def get_groq_client(api_key: str):
     return Groq(api_key=api_key)
 
-def groq_generate(client: Groq, model_name: str, prompt: str) -> str:
+def groq_generate(client: Groq, prompt: str) -> str:
     completion = client.chat.completions.create(
-        model=model_name,
+        model=DEFAULT_LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
         max_tokens=500,
     )
     return (completion.choices[0].message.content or "").strip()
 
-def build_vectorstore(docs: List[Document], embedding_model: str, hf_api_key: str, repo_url: str) -> Chroma:
+def build_vectorstore(docs: List[Document], embedding_model: str, hf_api_key: str) -> FAISS:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -171,14 +171,9 @@ def build_vectorstore(docs: List[Document], embedding_model: str, hf_api_key: st
     if not chunks:
         raise ValueError("No valid text chunks were generated from the repository.")
     embeddings = get_embeddings(embedding_model, hf_api_key)
-    collection_name = f"repo_{hashlib.sha1(repo_url.encode('utf-8')).hexdigest()[:12]}"
-    persist_dir = Path(tempfile.gettempdir()) / "github_rag_chroma"
-    persist_dir.mkdir(parents=True, exist_ok=True)
-    return Chroma.from_documents(
+    return FAISS.from_documents(
         documents=chunks,
         embedding=embeddings,
-        collection_name=collection_name,
-        persist_directory=str(persist_dir),
     )
 
 def format_sources(docs: List[Document], max_sources: int = 5) -> str:
@@ -197,7 +192,7 @@ def format_sources(docs: List[Document], max_sources: int = 5) -> str:
             break
     return "\n".join(out) if out else "_(sin fuentes)_"
 
-def rag_answer(query: str, vs: Chroma, llm_client: Groq, llm_model: str, k: int = TOP_K) -> Tuple[str, List[Document]]:
+def rag_answer(query: str, vs: FAISS, llm_client: Groq, k: int = TOP_K) -> Tuple[str, List[Document]]:
     retriever = vs.as_retriever(search_kwargs={"k": k})
     ctx_docs = retriever.get_relevant_documents(query)
 
@@ -214,10 +209,10 @@ def rag_answer(query: str, vs: Chroma, llm_client: Groq, llm_model: str, k: int 
     )
 
     prompt = f"{system}\n\nCONTEXTO:\n{context}\n\nPREGUNTA:\n{query}\n\nRESPUESTA:"
-    answer = groq_generate(llm_client, llm_model, prompt)
+    answer = groq_generate(llm_client, prompt)
     return answer, ctx_docs
 
-def generate_patch(request: str, vs: Chroma, llm_client: Groq, llm_model: str, k: int = TOP_K) -> Tuple[str, List[Document]]:
+def generate_patch(request: str, vs: FAISS, llm_client: Groq, k: int = TOP_K) -> Tuple[str, List[Document]]:
     """
     Genera un diff estilo git. No aplica cambios; solo muestra patch.
     """
@@ -237,7 +232,7 @@ def generate_patch(request: str, vs: Chroma, llm_client: Groq, llm_model: str, k
         "- Devuelve SOLO el diff, sin texto extra.\n"
     )
     prompt = f"{system}\n\nCONTEXTO:\n{context}\n\nPETICIÓN:\n{request}\n\nDIFF:"
-    diff = groq_generate(llm_client, llm_model, prompt)
+    diff = groq_generate(llm_client, prompt)
     return diff, ctx_docs
 
 
@@ -250,8 +245,8 @@ with st.sidebar:
     branch = st.text_input("Branch (opcional)", placeholder="main")
     embedding_model = st.text_input("Embeddings", value=DEFAULT_EMBEDDING_MODEL)
     hf_api_key = st.text_input("HUGGINGFACE_API_KEY", value=os.getenv("HUGGINGFACE_API_KEY", ""), type="password")
-    llm_model = st.text_input("LLM (Groq)", value=DEFAULT_LLM_MODEL)
     groq_api_key = st.text_input("GROQ_API_KEY", value=os.getenv("GROQ_API_KEY", ""), type="password")
+    st.caption(f"Groq model: `{DEFAULT_LLM_MODEL}`")
     top_k = st.slider("Top-K chunks", 3, 12, TOP_K)
     do_index = st.button("📥 Clonar + Indexar", type="primary")
 
@@ -261,8 +256,6 @@ if "repo_path" not in st.session_state:
     st.session_state.repo_path = None
 if "llm" not in st.session_state:
     st.session_state.llm = None
-if "llm_model" not in st.session_state:
-    st.session_state.llm_model = DEFAULT_LLM_MODEL
 
 if do_index:
     if not is_github_repo_url(repo_url):
@@ -290,13 +283,12 @@ if do_index:
             docs = make_line_aware_docs(Path(st.session_state.repo_path))
             st.write(f"📄 Documentos base: {len(docs)}")
 
-        with st.spinner("Construyendo índice vectorial (ChromaDB)…"):
-            vs = build_vectorstore(docs, embedding_model, hf_api_key.strip(), repo_url.strip())
+        with st.spinner("Construyendo índice vectorial (FAISS)…"):
+            vs = build_vectorstore(docs, embedding_model, hf_api_key.strip())
             st.session_state.vs = vs
 
         with st.spinner("Conectando con Groq..."):
             st.session_state.llm = get_groq_client(groq_api_key.strip())
-            st.session_state.llm_model = llm_model
 
         st.success("✅ Repo indexado. Ya puedes preguntar.")
 
@@ -307,7 +299,7 @@ with col1:
     q = st.text_area("Pregunta", placeholder="¿Cómo funciona el pipeline de ingestion? ¿Dónde está el entrypoint?")
     if st.button("Responder", disabled=(st.session_state.vs is None or st.session_state.llm is None)):
         with st.spinner("Pensando…"):
-            ans, src = rag_answer(q, st.session_state.vs, st.session_state.llm, st.session_state.llm_model, k=top_k)
+            ans, src = rag_answer(q, st.session_state.vs, st.session_state.llm, k=top_k)
         st.markdown(ans)
         st.markdown("**Fuentes**")
         st.markdown(format_sources(src))
@@ -317,7 +309,7 @@ with col2:
     req = st.text_area("Petición de cambio", placeholder="Añade validación de input y maneja errores en app.py")
     if st.button("Generar diff", disabled=(st.session_state.vs is None or st.session_state.llm is None)):
         with st.spinner("Generando…"):
-            diff, src = generate_patch(req, st.session_state.vs, st.session_state.llm, st.session_state.llm_model, k=top_k)
+            diff, src = generate_patch(req, st.session_state.vs, st.session_state.llm, k=top_k)
         st.code(diff, language="diff")
         st.markdown("**Fuentes usadas**")
         st.markdown(format_sources(src))
