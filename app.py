@@ -18,10 +18,11 @@ from langchain.schema import Document
 
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2" 
 DEFAULT_LLM_MODEL = "llama-3.1-8b-instant"
-MAX_FILES = 3000
+MAX_FILES = 600
 MAX_FILE_BYTES = 700_000  
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
+MAX_CHUNKS = 1200
 TOP_K = 6
 
 IGNORE_DIRS = {
