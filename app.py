@@ -9,18 +9,15 @@ from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 from git import Repo
+from groq import Groq
 
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-
-
-
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2" 
-DEFAULT_LLM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"  
+DEFAULT_LLM_MODEL = "llama-3.1-8b-instant"
 MAX_FILES = 3000
 MAX_FILE_BYTES = 700_000  
 CHUNK_SIZE = 1200
@@ -147,23 +144,17 @@ def get_embeddings(model_name: str):
     return HuggingFaceEmbeddings(model_name=model_name)
 
 @st.cache_resource(show_spinner=False)
-def get_llm_pipe(model_name: str):
-    tok = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype="auto",
-    )
-    gen = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tok,
-        max_new_tokens=500,
-        do_sample=True,
+def get_groq_client(api_key: str):
+    return Groq(api_key=api_key)
+
+def groq_generate(client: Groq, model_name: str, prompt: str) -> str:
+    completion = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
-        top_p=0.9,
+        max_tokens=500,
     )
-    return gen
+    return (completion.choices[0].message.content or "").strip()
 
 def build_vectorstore(docs: List[Document], embedding_model: str) -> FAISS:
     splitter = RecursiveCharacterTextSplitter(
@@ -191,7 +182,7 @@ def format_sources(docs: List[Document], max_sources: int = 5) -> str:
             break
     return "\n".join(out) if out else "_(sin fuentes)_"
 
-def rag_answer(query: str, vs: FAISS, llm_gen, k: int = TOP_K) -> Tuple[str, List[Document]]:
+def rag_answer(query: str, vs: FAISS, llm_client: Groq, llm_model: str, k: int = TOP_K) -> Tuple[str, List[Document]]:
     retriever = vs.as_retriever(search_kwargs={"k": k})
     ctx_docs = retriever.get_relevant_documents(query)
 
@@ -208,12 +199,10 @@ def rag_answer(query: str, vs: FAISS, llm_gen, k: int = TOP_K) -> Tuple[str, Lis
     )
 
     prompt = f"{system}\n\nCONTEXTO:\n{context}\n\nPREGUNTA:\n{query}\n\nRESPUESTA:"
-    out = llm_gen(prompt)[0]["generated_text"]
-    # El pipeline devuelve prompt + completion; recortamos un poco:
-    answer = out.split("RESPUESTA:")[-1].strip()
+    answer = groq_generate(llm_client, llm_model, prompt)
     return answer, ctx_docs
 
-def generate_patch(request: str, vs: FAISS, llm_gen, k: int = TOP_K) -> Tuple[str, List[Document]]:
+def generate_patch(request: str, vs: FAISS, llm_client: Groq, llm_model: str, k: int = TOP_K) -> Tuple[str, List[Document]]:
     """
     Genera un diff estilo git. No aplica cambios; solo muestra patch.
     """
@@ -233,8 +222,7 @@ def generate_patch(request: str, vs: FAISS, llm_gen, k: int = TOP_K) -> Tuple[st
         "- Devuelve SOLO el diff, sin texto extra.\n"
     )
     prompt = f"{system}\n\nCONTEXTO:\n{context}\n\nPETICIÓN:\n{request}\n\nDIFF:"
-    out = llm_gen(prompt)[0]["generated_text"]
-    diff = out.split("DIFF:")[-1].strip()
+    diff = groq_generate(llm_client, llm_model, prompt)
     return diff, ctx_docs
 
 
@@ -246,7 +234,8 @@ with st.sidebar:
     repo_url = st.text_input("URL repo público", placeholder="https://github.com/user/repo")
     branch = st.text_input("Branch (opcional)", placeholder="main")
     embedding_model = st.text_input("Embeddings", value=DEFAULT_EMBEDDING_MODEL)
-    llm_model = st.text_input("LLM (local HF)", value=DEFAULT_LLM_MODEL)
+    llm_model = st.text_input("LLM (Groq)", value=DEFAULT_LLM_MODEL)
+    groq_api_key = st.text_input("GROQ_API_KEY", value=os.getenv("GROQ_API_KEY", ""), type="password")
     top_k = st.slider("Top-K chunks", 3, 12, TOP_K)
     do_index = st.button("📥 Clonar + Indexar", type="primary")
 
@@ -256,10 +245,14 @@ if "repo_path" not in st.session_state:
     st.session_state.repo_path = None
 if "llm" not in st.session_state:
     st.session_state.llm = None
+if "llm_model" not in st.session_state:
+    st.session_state.llm_model = DEFAULT_LLM_MODEL
 
 if do_index:
     if not is_github_repo_url(repo_url):
         st.error("URL inválida. Usa formato: https://github.com/user/repo")
+    elif not groq_api_key.strip():
+        st.error("Missing GROQ_API_KEY. Add it in the sidebar or as an environment variable.")
     else:
         with st.spinner("Clonando repo…"):
             base_tmp = Path(tempfile.gettempdir())
@@ -283,8 +276,9 @@ if do_index:
             vs = build_vectorstore(docs, embedding_model)
             st.session_state.vs = vs
 
-        with st.spinner("Cargando LLM local…"):
-            st.session_state.llm = get_llm_pipe(llm_model)
+        with st.spinner("Conectando con Groq..."):
+            st.session_state.llm = get_groq_client(groq_api_key.strip())
+            st.session_state.llm_model = llm_model
 
         st.success("✅ Repo indexado. Ya puedes preguntar.")
 
@@ -295,7 +289,7 @@ with col1:
     q = st.text_area("Pregunta", placeholder="¿Cómo funciona el pipeline de ingestion? ¿Dónde está el entrypoint?")
     if st.button("Responder", disabled=(st.session_state.vs is None or st.session_state.llm is None)):
         with st.spinner("Pensando…"):
-            ans, src = rag_answer(q, st.session_state.vs, st.session_state.llm, k=top_k)
+            ans, src = rag_answer(q, st.session_state.vs, st.session_state.llm, st.session_state.llm_model, k=top_k)
         st.markdown(ans)
         st.markdown("**Fuentes**")
         st.markdown(format_sources(src))
@@ -305,7 +299,7 @@ with col2:
     req = st.text_area("Petición de cambio", placeholder="Añade validación de input y maneja errores en app.py")
     if st.button("Generar diff", disabled=(st.session_state.vs is None or st.session_state.llm is None)):
         with st.spinner("Generando…"):
-            diff, src = generate_patch(req, st.session_state.vs, st.session_state.llm, k=top_k)
+            diff, src = generate_patch(req, st.session_state.vs, st.session_state.llm, st.session_state.llm_model, k=top_k)
         st.code(diff, language="diff")
         st.markdown("**Fuentes usadas**")
         st.markdown(format_sources(src))
